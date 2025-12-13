@@ -2,10 +2,13 @@
 asgiref==3.11.0
 boto3==1.42.9
 botocore==1.42.9
+certifi==2025.11.12
+charset-normalizer==3.4.4
 Django==5.2.8
 django-cors-headers==4.9.0
 django-ninja==1.5.1
 djangorestframework==3.16.1
+idna==3.11
 jmespath==1.0.1
 numpy==2.3.5
 pgvector==0.4.2
@@ -15,9 +18,12 @@ pydantic_core==2.41.5
 pypdf==6.4.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
+regex==2025.11.3
+requests==2.32.5
 s3transfer==0.16.0
 six==1.17.0
 sqlparse==0.5.4
+tiktoken==0.12.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2025.2

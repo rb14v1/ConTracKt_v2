@@ -4,7 +4,7 @@ from django.shortcuts import get_object_or_404
 from django.contrib.postgres.search import SearchVector
 from .models import Document, DocumentChunk
 from .schemas import ChatIn, ChatOut, DocumentOut
-from .services import search_hybrid, get_embedding, search_vector_db, call_llm, create_presigned_url
+from .services import search_hybrid, get_embedding, call_llm, create_presigned_url
 from pypdf import PdfReader
 import time
 import io
