@@ -4,14 +4,12 @@ from django.shortcuts import get_object_or_404
 from django.contrib.postgres.search import SearchVector
 from .models import Document, DocumentChunk
 from .schemas import ChatIn, ChatOut, DocumentOut
-from .services import search_hybrid, get_embedding, call_llm, create_presigned_url
+from .services import search_hybrid, get_embedding, call_llm, create_presigned_url, determine_search_depth
 from pypdf import PdfReader
 import time
-import io
-import tiktoken
 
 
-api = NinjaAPI(title="RAG AI API")
+api = NinjaAPI(title="ConTracKt AI API")
 
 @api.post("/upload", response=DocumentOut)
 def upload_document(request, file: UploadedFile = File(...)):
@@ -21,7 +19,8 @@ def upload_document(request, file: UploadedFile = File(...)):
     3. Chunks & Embeds into PGVector
     """
     start_time = time.time()
-    
+    if file.size > 10 * 1024 * 1024:
+        raise ValueError("File too large. Maximum size is 10MB.")
     # A. Read PDF (Ideally, move this to Celery for large files)
     pdf_reader = PdfReader(file.file)
     file_content = file.file.read() # Read binary for S3
@@ -67,44 +66,74 @@ async def chat_endpoint(request, payload: ChatIn):
     start = time.time()
     from asgiref.sync import sync_to_async
     
-    k_value = 20
-    # 1. INCREASE TOP_K to 8 or 10
-    # Why? To ensure we catch chunks from ALL documents, not just the first two matches.
-    search_results = await sync_to_async(search_hybrid)(
+    # 1. DYNAMIC DEPTH ANALYSIS
+    # Ask LLM how deep we need to dig (Returns e.g., 10, 20, or 60)
+    k_value = await sync_to_async(determine_search_depth)(payload.query)
+    print(f"🧠 Query Intent Analysis: Retrieving Top-{k_value} chunks.")
+    
+    # 2. HYBRID SEARCH (OVERSAMPLING)
+    # We fetch 3x the required chunks. Why? Because if Doc A has 50 matches and Doc B has 1,
+    # a standard search might fill up with only Doc A. We need extra candidates for diversity.
+    raw_results = await sync_to_async(search_hybrid)(
         payload.query, 
-        top_k=k_value
+        top_k=k_value * 3
     )
     
-    # 2. CONTEXT INJECTION (The Silver Bullet)
-    # We must explicitly tell the LLM: "This text comes from File X"
+    # 3. DIVERSITY RE-RANKING (The Fix for "Missed Files")
+    # Goal: Ensure every matching document gets at least one slot in the context.
+    # Logic: Group chunks by Document -> Pick 1 from A, 1 from B, 1 from C -> Repeat.
+    
+    grouped_results = {}
+    for res in raw_results:
+        title = res.document.title
+        if title not in grouped_results:
+            grouped_results[title] = []
+        grouped_results[title].append(res)
+        
+    final_context_list = []
+    has_more_chunks = True
+    
+    # Round-Robin Selection Loop
+    while has_more_chunks and len(final_context_list) < k_value:
+        has_more_chunks = False
+        # Sort keys to ensure deterministic order
+        for title in sorted(grouped_results.keys()):
+            if grouped_results[title]:
+                # Take the highest scoring remaining chunk from this doc
+                chunk = grouped_results[title].pop(0)
+                final_context_list.append(chunk)
+                has_more_chunks = True
+                
+                if len(final_context_list) >= k_value:
+                    break
+    
+    # 4. CONTEXT CONSTRUCTION (With Safety Pruning)
     context_chunks = []
     current_char_count = 0
     
-    # 1. Sort results by relevance score (Highest first)
-    # This ensures we keep the BEST facts if we run out of space
-    sorted_results = sorted(search_results, key=lambda x: getattr(x, 'score', 0), reverse=True)
-    for c in sorted_results:
+    for c in final_context_list:
+        # Tag content so LLM knows where it came from
         chunk_text = f"[[SOURCE: {c.document.title}]]\n{c.text_content}\n\n"
         chunk_len = len(chunk_text)
         
-        # 2. Check if adding this chunk exceeds our limit
+        # STOP if we exceed the safety limit (e.g. 50,000 chars)
         if current_char_count + chunk_len > MAX_CONTEXT_CHARS:
-            print(f"⚠️ Context limit reached. Dropping lower ranked chunk from {c.document.title}")
-            continue # Skip this chunk, try the next (or break)
+            print(f"⚠️ Context limit ({MAX_CONTEXT_CHARS}) reached. Pruning remaining chunks.")
+            continue
             
         context_chunks.append(chunk_text)
         current_char_count += chunk_len
 
-    # 3. Join the pruned context
     context_str = "".join(context_chunks)
     
-    # 3. Call LLM
+    # 5. CALL LLM
     answer = await sync_to_async(call_llm)(context_str, payload.query)
     
-    # 4. Format Sources
+    # 6. FORMAT SOURCES
+    # We return sources for ALL chunks we actually used (final_context_list)
     seen_urls = set()
     sources = []
-    for res in search_results:
+    for res in final_context_list:
         unique_key = f"{res.document.title}-{res.chunk_index}"
         if unique_key not in seen_urls:
             sources.append({

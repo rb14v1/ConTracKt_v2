@@ -9,6 +9,7 @@ from django.db.models import F
 from django.conf import settings
 from pgvector.django import CosineDistance
 from .models import DocumentChunk
+import re
 
 # 1. Initialize AWS Clients
 my_config = Config(
@@ -136,9 +137,10 @@ def call_llm(context_text: str, user_query: str) -> str:
     Each chunk starts with a tag like [[SOURCE: filename.pdf]].
     
     INSTRUCTIONS:
-    1. Answer the user's question accurately.
+    1. Answer the user's question accurately based ONLY on the provided context.
     2. STRICTLY SEPARATE your answer by the Document Title found in the [[SOURCE]] tag.
-    3. Use this EXACT format:
+    3. CRITICAL: If a document does not contain the answer, DO NOT LIST IT. Do not write "No information available" or "Not mentioned". Just skip it entirely.
+    4. Use this EXACT format for documents that have an answer:
 
     ### SOURCE: [Insert Exact Filename from tag]
     [Write the answer derived from this document]
@@ -174,6 +176,26 @@ def call_llm(context_text: str, user_query: str) -> str:
 
         print(f"DEBUG: Sending query to Llama 3... (Length: {len(prompt)})")
         # --- FALLBACK RETRY LOGIC ---
+        segments = re.split(r'(### SOURCE: .*)', answer)
+        clean_segments = []
+        
+        # 2. Filter out "No info" blocks
+        current_header = ""
+        for seg in segments:
+            if seg.startswith("### SOURCE:"):
+                current_header = seg
+            else:
+                text_body = seg.strip()
+                # Dynamic Check: Look for the specific tag OR extreme brevity
+                is_empty_tag = "[[EMPTY]]" in text_body
+                is_too_short = len(text_body) < 10 # "No info" is usually short
+                
+                if current_header and text_body and not is_empty_tag and not is_too_short:
+                    clean_segments.append(current_header)
+                    clean_segments.append(seg)
+                current_header = ""
+
+        answer = "".join(clean_segments).strip()
         if not answer:
             print("⚠️ Empty response from LLM. Retrying with shorter context...")
             # Retry with HALF the context
@@ -204,7 +226,8 @@ def call_llm(context_text: str, user_query: str) -> str:
 
     except Exception as e:
         print(f"CRITICAL ERROR in call_llm: {str(e)}")
-        return f"Error calling LLM: {str(e)}"
+        print(f"LLM Error: {str(e)}")
+        return f"Error calling LLM: \n System is currently overloaded. Please try again.{str(e)}"
     
 def create_presigned_url(object_key: str, expiration: int = 3600) -> str:
     """
@@ -241,3 +264,50 @@ def create_presigned_url(object_key: str, expiration: int = 3600) -> str:
     except Exception as e:
         print(f"❌ An unexpected error occurred generating pre-signed URL: {e}")
         return None
+    
+def determine_search_depth(user_query: str) -> int:
+    """
+    Uses LLM to dynamically decide how many chunks to retrieve.
+    Returns an integer (e.g., 5, 20, 50).
+    """
+    prompt = f"""
+    <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    You are a Search Optimization Engine. Analyze the user's query and output ONLY a single integer representing the optimal number of document chunks ('top_k') to retrieve.
+
+    RULES:
+    - If the query seeks a specific fact (e.g., "What is the date?", "Who is..."), output 10.
+    - If the query asks for a comparison (e.g., "Compare X and Y"), output 25.
+    - If the query is broad, exhaustive, or asks for lists/summaries across many files (e.g., "List all...", "Find every...", "Summary of agreements"), output 60.
+    
+    Output ONLY the integer. No text.
+    <|eot_id|><|start_header_id|>user<|end_header_id|>
+    {user_query}
+    <|eot_id|><|start_header_id|>assistant<|end_header_id|>
+    """
+
+    body = {
+        "prompt": prompt,
+        "max_gen_len": 10, # We only need a number
+        "temperature": 0.0 # Deterministic
+    }
+
+    try:
+        response = bedrock_client.invoke_model(
+            modelId="meta.llama3-70b-instruct-v1:0",
+            body=json.dumps(body)
+        )
+        response_body = json.loads(response['body'].read())
+        answer = response_body.get('generation', '').strip()
+        
+        # Extract number safely
+        import re
+        match = re.search(r'\d+', answer)
+        if match:
+            k = int(match.group())
+            # Safety bounds
+            return max(5, min(k, 100))
+        return 20 # Default fallback
+        
+    except Exception as e:
+        print(f"⚠️ Intent Error: {e}")
+        return 20 # Safe fallback    
