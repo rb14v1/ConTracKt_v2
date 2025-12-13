@@ -1,6 +1,8 @@
 # api/models.py
 from django.db import models
 from pgvector.django import VectorField, HnswIndex
+from django.contrib.postgres.search import SearchVectorField
+from django.contrib.postgres.indexes import GinIndex
 
 class Document(models.Model):
     """The Parent: Stores file metadata"""
@@ -13,23 +15,24 @@ class Document(models.Model):
         return self.title
 
 class DocumentChunk(models.Model):
-    """The Child: Stores text and embeddings"""
     document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='chunks')
     chunk_index = models.IntegerField()
     text_content = models.TextField()
     
-    # 1024 is the dimension for Amazon Titan v2 Embeddings. 
-    # If using Cohere, change to 1024 (v3-english) or appropriate size.
     embedding = VectorField(dimensions=1024) 
+    
+    # 1. ADD THIS FIELD (Stores keyword tokens)
+    search_vector = SearchVectorField(null=True)
 
     class Meta:
         indexes = [
-            # USE THIS instead of models.Index
             HnswIndex(
                 name='cosine_idx',
                 fields=['embedding'],
                 m=16,
                 ef_construction=64,
                 opclasses=['vector_cosine_ops']
-            )
+            ),
+            # 2. ADD THIS INDEX (Makes keyword search fast)
+            GinIndex(fields=['search_vector'], name='keyword_idx'),
         ]

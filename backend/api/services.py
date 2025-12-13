@@ -4,6 +4,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 import json
 import os
+from django.contrib.postgres.search import SearchQuery, SearchRank
+from django.db.models import F
 from django.conf import settings
 from pgvector.django import CosineDistance
 from .models import DocumentChunk
@@ -77,6 +79,48 @@ def search_vector_db(query_text: str, top_k: int = 5):
     
     return results
 
+
+def search_hybrid(query_text: str, top_k: int = 15):
+    """
+    Performs Hybrid Search with RRF Fusion
+    """
+    # 1. Run Vector Search
+    vector_results = search_vector_db(query_text, top_k=20)
+    
+    # 2. Run Keyword Search
+    keyword_results = DocumentChunk.objects.annotate(
+        rank=SearchRank(F('search_vector'), SearchQuery(query_text))
+    ).filter(rank__gt=0).order_by('-rank')[:20]
+
+    # 3. Apply Reciprocal Rank Fusion (RRF)
+    k_constant = 60
+    rrf_scores = {}
+
+    for rank, item in enumerate(vector_results):
+        if item.id not in rrf_scores: rrf_scores[item.id] = 0
+        rrf_scores[item.id] += 1 / (k_constant + rank + 1)
+
+    for rank, item in enumerate(keyword_results):
+        if item.id not in rrf_scores: rrf_scores[item.id] = 0
+        rrf_scores[item.id] += 1 / (k_constant + rank + 1)
+
+    # 4. Sort IDs by Score
+    sorted_ids = sorted(rrf_scores, key=rrf_scores.get, reverse=True)[:top_k]
+
+    # 5. Fetch Objects & ATTACH SCORES (The Fix)
+    candidates = DocumentChunk.objects.filter(id__in=sorted_ids).select_related('document')
+    candidate_map = {c.id: c for c in candidates}
+    
+    final_results = []
+    for _id in sorted_ids:
+        if _id in candidate_map:
+            chunk = candidate_map[_id]
+            # --- CRITICAL FIX: Attach the score dynamically ---
+            chunk.score = rrf_scores[_id] 
+            final_results.append(chunk)
+
+    return final_results
+
 # api/services.py (Update this function)
 
 def call_llm(context_text: str, user_query: str) -> str:
@@ -117,27 +161,45 @@ def call_llm(context_text: str, user_query: str) -> str:
         "temperature": 0.1,
         "top_p": 0.9
     }
-
+    total_input = len(context_text) + len(user_query)
+    print(f"DEBUG: Total Input Chars: {total_input}")
+    
     try:
-        # 2. Call Bedrock
-        print(f"DEBUG: Sending query to Llama 3... (Length: {len(prompt)})")
-        
         response = bedrock_client.invoke_model(
             modelId="meta.llama3-70b-instruct-v1:0",
             body=json.dumps(body)
         )
-        
-        # 3. Read Response
         response_body = json.loads(response['body'].read())
-        print("DEBUG: Raw Bedrock Response:", response_body) # <--- THIS WILL REVEAL THE TRUTH
-        
-        # 4. Extract Answer
-        # Llama 3 on Bedrock returns key 'generation'
         answer = response_body.get('generation', '')
-        
+
+        print(f"DEBUG: Sending query to Llama 3... (Length: {len(prompt)})")
+        # --- FALLBACK RETRY LOGIC ---
         if not answer:
-            return "Error: LLM returned empty response. Check server logs."
+            print("⚠️ Empty response from LLM. Retrying with shorter context...")
+            # Retry with HALF the context
+            half_context = context_text[:len(context_text)//2]
             
+            # Re-construct prompt with half context
+            retry_prompt = f"""
+            <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+            (Instructions...)
+            Context: {half_context}
+            <|eot_id|><|start_header_id|>user<|end_header_id|>
+            {user_query}
+            <|eot_id|><|start_header_id|>assistant<|end_header_id|>
+            """
+            
+            body['prompt'] = retry_prompt
+            response = bedrock_client.invoke_model(
+                modelId="meta.llama3-70b-instruct-v1:0",
+                body=json.dumps(body)
+            )
+            response_body = json.loads(response['body'].read())
+            answer = response_body.get('generation', '')
+            
+            if not answer:
+                return "Error: The query and documents are too large for the model to process at once. Please ask a more specific question."
+
         return answer.strip()
 
     except Exception as e:
