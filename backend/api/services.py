@@ -187,10 +187,17 @@ def call_llm(context_text: str, user_query: str) -> str:
             else:
                 text_body = seg.strip()
                 # Dynamic Check: Look for the specific tag OR extreme brevity
+                is_empty = any(phrase in text_body for phrase in [
+                    "no information available", 
+                    "not mentioned", 
+                    "does not contain", 
+                    "no specific information",
+                    "not provided in this document"
+                ])
                 is_empty_tag = "[[EMPTY]]" in text_body
                 is_too_short = len(text_body) < 10 # "No info" is usually short
                 
-                if current_header and text_body and not is_empty_tag and not is_too_short:
+                if current_header and text_body and not is_empty_tag and not is_empty and not is_too_short:
                     clean_segments.append(current_header)
                     clean_segments.append(seg)
                 current_header = ""
