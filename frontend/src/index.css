@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+:root {
+  --v1-teal: #008f8f;
+  --v1-teal-dark: #007575;
+  --v1-bg: #f7f9fa;
+  --v1-surface: #ffffff;
+  --v1-border: #e5e7eb;
+  --v1-text: #1f2937;
+  --v1-text-light: #6b7280;
+}
