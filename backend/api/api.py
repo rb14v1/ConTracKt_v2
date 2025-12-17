@@ -7,6 +7,7 @@ from .schemas import ChatIn, ChatOut, DocumentOut
 from .services import search_hybrid, get_embedding, call_llm, create_presigned_url, determine_search_depth
 from pypdf import PdfReader
 import time
+import re
 
 
 api = NinjaAPI(title="ConTracKt AI API")
@@ -126,26 +127,73 @@ async def chat_endpoint(request, payload: ChatIn):
 
     context_str = "".join(context_chunks)
     
-    # 5. CALL LLM
-    answer = await sync_to_async(call_llm)(context_str, payload.query)
+    # 5. CALL LLM (Now returns text with [[REASON: ...]] tags)
+    raw_llm_response = await sync_to_async(call_llm)(context_str, payload.query)
     
-    # 6. FORMAT SOURCES
-    # We return sources for ALL chunks we actually used (final_context_list)
+    # --- 6. INTELLIGENT PARSING LOGIC (The Fix) ---
+    clean_answer_parts = []
+    source_reasoning_map = {} # Stores "DocTitle" -> "Reason"
+    
+    # Split by Source Headers
+    segments = re.split(r'(### SOURCE: .*)', raw_llm_response)
+    current_title = None
+    
+    for seg in segments:
+        if seg.startswith("### SOURCE:"):
+            current_title = seg.replace("### SOURCE:", "").strip()
+            clean_answer_parts.append(seg) # Keep header
+        else:
+            text_body = seg.strip()
+            if not current_title or not text_body: continue
+            
+            # Filter empty blocks
+            if "[[EMPTY]]" in text_body or len(text_body) < 10:
+                if clean_answer_parts and clean_answer_parts[-1].startswith("### SOURCE:"):
+                    clean_answer_parts.pop() 
+                current_title = None
+                continue
+
+            # Extract Reasoning Tag
+            reason_match = re.search(r'\[\[REASON:(.*?)\]\]', text_body, re.DOTALL)
+            if reason_match:
+                reason_text = reason_match.group(1).strip()
+                source_reasoning_map[current_title] = reason_text
+                
+                # Clean the text for display
+                clean_text = text_body.replace(reason_match.group(0), "").strip()
+                clean_answer_parts.append(clean_text)
+            else:
+                # Fallback
+                source_reasoning_map[current_title] = "Contextual match found by AI analysis."
+                clean_answer_parts.append(text_body)
+
+    final_clean_answer = "\n".join(clean_answer_parts)
+    
+    # 7. FORMAT SOURCES (Attach AI Reason)
     seen_urls = set()
     sources = []
+    
     for res in final_context_list:
-        unique_key = f"{res.document.title}-{res.chunk_index}"
-        if unique_key not in seen_urls:
-            sources.append({
-                "title": res.document.title, 
-                "page": res.chunk_index, 
-                "score": getattr(res, 'score', 0.0), 
-                "file_url": create_presigned_url(res.document.s3_key)
-            })
-            seen_urls.add(unique_key)
+        if res.document.title in source_reasoning_map:
+            unique_key = f"{res.document.title}-{res.chunk_index}"
+            if unique_key not in seen_urls:
+                clean_snippet = res.text_content[:600].replace("\n", " ") + "..."
+                
+                # Use reason from map, or fallback to score-based logic
+                ai_reason = source_reasoning_map.get(res.document.title, "Matched relevant context.")
+                
+                sources.append({
+                    "title": res.document.title, 
+                    "page": res.chunk_index, 
+                    "score": getattr(res, 'score', 0.0), 
+                    "file_url": create_presigned_url(res.document.s3_key),
+                    "snippet": clean_snippet,
+                    "reason": ai_reason # <--- Dynamic LLM Reason
+                })
+                seen_urls.add(unique_key)
     
     return {
-        "answer": answer,
+        "answer": final_clean_answer,
         "sources": sources,
         "processing_time": time.time() - start
     }

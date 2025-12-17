@@ -3,6 +3,8 @@ export interface Source {
   page: number;
   score: number;
   file_url: string | null;
+  snippet?: string;
+  reason?: string;
 }
 
 export interface ChatResponse {

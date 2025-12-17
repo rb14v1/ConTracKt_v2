@@ -4,6 +4,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 import json
 import os
+from datetime import datetime
 from django.contrib.postgres.search import SearchQuery, SearchRank
 from django.db.models import F
 from django.conf import settings
@@ -125,30 +126,47 @@ def search_hybrid(query_text: str, top_k: int = 15):
 # api/services.py (Update this function)
 
 def call_llm(context_text: str, user_query: str) -> str:
+    
+    # 1. TIME INJECTION
+    current_date = datetime.now().strftime("%A, %B %d, %Y")
     """
     Calls the LLM (Llama 3 70B via Bedrock)
     """
     # 1. Improved Llama 3 Prompt Format
     # Llama 3 expects strict <|begin_of_text|>... formatting
-    prompt = f"""
+    prompt=f"""
     <|begin_of_text|><|start_header_id|>system<|end_header_id|>
     You are an expert AI analyst. 
-    You have been provided with context chunks from various documents. 
-    Each chunk starts with a tag like [[SOURCE: filename.pdf]].
+    Current Date: {current_date}
     
     INSTRUCTIONS:
-    1. Answer the user's question accurately based ONLY on the provided context.
-    2. STRICTLY SEPARATE your answer by the Document Title found in the [[SOURCE]] tag.
-    3. CRITICAL: If a document does not contain the answer, DO NOT LIST IT. Do not write "No information available" or "Not mentioned". Just skip it entirely.
-    4. Use this EXACT format for documents that have an answer:
+    1. PRIMARY GOAL: Answer the user's question accurately based on the provided context.
+    
+    2. HANDLING GREETINGS vs UNKNOWN INFO:
+       - CASE A: If the user says "Hello", "Hi", or "Good morning":
+         - HEADER: ### SOURCE: General Analysis
+         - REASON: [[REASON: Greeting]]
+         - ANSWER: Hello! I am ready to help you analyze your documents. What would you like to know?
+         
+       - CASE B: If the question is NOT in the context (e.g., "What is quantum physics?", "Who is the President?"):
+         - HEADER: ### SOURCE: General Analysis
+         - REASON: [[REASON: Outside of knowledge base]]
+         - ANSWER: I apologize, but I cannot find information regarding that topic in your uploaded documents. I can only answer questions based on the content provided.
 
-    ### SOURCE: [Insert Exact Filename from tag]
-    [Write the answer derived from this document]
+    3. DOCUMENT ANSWERS (Standard):
+       - STRICTLY SEPARATE your answer by the Document Title found in the [[SOURCE]] tag.
+       - Use this EXACT format:
 
-    ### SOURCE: [Insert Next Filename]
-    [Write answer...]
+       ### SOURCE: [Insert Exact Filename from tag]
+       [[REASON: write one sentence reasoning here...]]
+       [Write the answer derived from this document]
 
-    If a document does not contain the answer, do not list it.
+    CRITICAL: 
+    - If a document is irrelevant to the question, DO NOT LIST IT.
+    - If no documents contain the answer and it is NOT a general conversation, state:
+      ### SOURCE: General Analysis
+      [[REASON: Context missing]]
+      I apologize, but I couldn't find specific information regarding that in the uploaded documents.
 
     Context:
     {context_text}
@@ -186,8 +204,11 @@ def call_llm(context_text: str, user_query: str) -> str:
                 current_header = seg
             else:
                 text_body = seg.strip()
+                
+                is_general_analysis = "General Analysis" in current_header
                 # Dynamic Check: Look for the specific tag OR extreme brevity
                 is_empty = any(phrase in text_body for phrase in [
+                    "[[EMPTY]]",
                     "no information available", 
                     "not mentioned", 
                     "does not contain", 
@@ -195,7 +216,7 @@ def call_llm(context_text: str, user_query: str) -> str:
                     "not provided in this document"
                 ])
                 is_empty_tag = "[[EMPTY]]" in text_body
-                is_too_short = len(text_body) < 10 # "No info" is usually short
+                is_too_short = len(text_body) < 5 # "No info" is usually short
                 
                 if current_header and text_body and not is_empty_tag and not is_empty and not is_too_short:
                     clean_segments.append(current_header)

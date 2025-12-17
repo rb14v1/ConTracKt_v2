@@ -20,6 +20,8 @@ class SourceNode(Schema):
     page: int
     score: float # Similarity score
     file_url: Optional[str] = None
+    snippet: Optional[str] = None
+    reason: Optional[str] = None
 
 class ChatOut(Schema):
     """Schema for AI response"""
