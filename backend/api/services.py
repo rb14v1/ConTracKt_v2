@@ -269,7 +269,7 @@ def determine_search_depth(user_query: str) -> int:
     RULES:
     - If the query seeks a specific fact (e.g., "What is the date?", "Who is..."), output 10.
     - If the query asks for a comparison (e.g., "Compare X and Y"), output 25.
-    - If the query is broad, exhaustive, or asks for lists (e.g., "List all...", "Summary of..."), output 60.
+    - If the query is broad, exhaustive, or asks for lists (e.g., "List all...", "Summary of..."), output 600.
     
     Output ONLY the integer. No text.
     """
@@ -291,7 +291,7 @@ def determine_search_depth(user_query: str) -> int:
         match = re.search(r'\d+', answer)
         if match:
             k = int(match.group())
-            return max(5, min(k, 100))
+            return max(5, min(k, 1000))
         return 20 
         
     except Exception as e:
