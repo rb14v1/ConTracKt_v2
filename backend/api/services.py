@@ -11,6 +11,7 @@ from django.conf import settings
 from pgvector.django import CosineDistance
 from .models import DocumentChunk
 import re
+from openai import AzureOpenAI
 
 # 1. Initialize AWS Clients
 my_config = Config(
@@ -125,137 +126,6 @@ def search_hybrid(query_text: str, top_k: int = 15):
 
 # api/services.py (Update this function)
 
-def call_llm(context_text: str, user_query: str) -> str:
-    
-    # 1. TIME INJECTION
-    current_date = datetime.now().strftime("%A, %B %d, %Y")
-    """
-    Calls the LLM (Llama 3 70B via Bedrock)
-    """
-    # 1. Improved Llama 3 Prompt Format
-    # Llama 3 expects strict <|begin_of_text|>... formatting
-    prompt=f"""
-    <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-    You are an expert AI analyst. 
-    Current Date: {current_date}
-    
-    INSTRUCTIONS:
-    1. PRIMARY GOAL: Answer the user's question accurately based on the provided context.
-    
-    2. HANDLING GREETINGS vs UNKNOWN INFO:
-       - CASE A: If the user says "Hello", "Hi", or "Good morning":
-         - HEADER: ### SOURCE: General Analysis
-         - REASON: [[REASON: Greeting]]
-         - ANSWER: Hello! I am ready to help you analyze your documents. What would you like to know?
-         
-       - CASE B: If the question is NOT in the context (e.g., "What is quantum physics?", "Who is the President?"):
-         - HEADER: ### SOURCE: General Analysis
-         - REASON: [[REASON: Outside of knowledge base]]
-         - ANSWER: I apologize, but I cannot find information regarding that topic in your uploaded documents. I can only answer questions based on the content provided.
-
-    3. DOCUMENT ANSWERS (Standard):
-       - STRICTLY SEPARATE your answer by the Document Title found in the [[SOURCE]] tag.
-       - Use this EXACT format:
-
-       ### SOURCE: [Insert Exact Filename from tag]
-       [[REASON: write one sentence reasoning here...]]
-       [Write the answer derived from this document]
-
-    CRITICAL: 
-    - If a document is irrelevant to the question, DO NOT LIST IT.
-    - If no documents contain the answer and it is NOT a general conversation, state:
-      ### SOURCE: General Analysis
-      [[REASON: Context missing]]
-      I apologize, but I couldn't find specific information regarding that in the uploaded documents.
-
-    Context:
-    {context_text}
-    <|eot_id|><|start_header_id|>user<|end_header_id|>
-    {user_query}
-    <|eot_id|><|start_header_id|>assistant<|end_header_id|>
-    """
-
-    body = {
-        "prompt": prompt,
-        "max_gen_len": 2048,
-        "temperature": 0.1,
-        "top_p": 0.9
-    }
-    total_input = len(context_text) + len(user_query)
-    print(f"DEBUG: Total Input Chars: {total_input}")
-    
-    try:
-        response = bedrock_client.invoke_model(
-            modelId="meta.llama3-70b-instruct-v1:0",
-            body=json.dumps(body)
-        )
-        response_body = json.loads(response['body'].read())
-        answer = response_body.get('generation', '')
-
-        print(f"DEBUG: Sending query to Llama 3... (Length: {len(prompt)})")
-        # --- FALLBACK RETRY LOGIC ---
-        segments = re.split(r'(### SOURCE: .*)', answer)
-        clean_segments = []
-        
-        # 2. Filter out "No info" blocks
-        current_header = ""
-        for seg in segments:
-            if seg.startswith("### SOURCE:"):
-                current_header = seg
-            else:
-                text_body = seg.strip()
-                
-                is_general_analysis = "General Analysis" in current_header
-                # Dynamic Check: Look for the specific tag OR extreme brevity
-                is_empty = any(phrase in text_body for phrase in [
-                    "[[EMPTY]]",
-                    "no information available", 
-                    "not mentioned", 
-                    "does not contain", 
-                    "no specific information",
-                    "not provided in this document"
-                ])
-                is_empty_tag = "[[EMPTY]]" in text_body
-                is_too_short = len(text_body) < 5 # "No info" is usually short
-                
-                if current_header and text_body and not is_empty_tag and not is_empty and not is_too_short:
-                    clean_segments.append(current_header)
-                    clean_segments.append(seg)
-                current_header = ""
-
-        answer = "".join(clean_segments).strip()
-        if not answer:
-            print("⚠️ Empty response from LLM. Retrying with shorter context...")
-            # Retry with HALF the context
-            half_context = context_text[:len(context_text)//2]
-            
-            # Re-construct prompt with half context
-            retry_prompt = f"""
-            <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-            (Instructions...)
-            Context: {half_context}
-            <|eot_id|><|start_header_id|>user<|end_header_id|>
-            {user_query}
-            <|eot_id|><|start_header_id|>assistant<|end_header_id|>
-            """
-            
-            body['prompt'] = retry_prompt
-            response = bedrock_client.invoke_model(
-                modelId="meta.llama3-70b-instruct-v1:0",
-                body=json.dumps(body)
-            )
-            response_body = json.loads(response['body'].read())
-            answer = response_body.get('generation', '')
-            
-            if not answer:
-                return "Error: The query and documents are too large for the model to process at once. Please ask a more specific question."
-
-        return answer.strip()
-
-    except Exception as e:
-        print(f"CRITICAL ERROR in call_llm: {str(e)}")
-        print(f"LLM Error: {str(e)}")
-        return f"Error calling LLM: \n System is currently overloaded. Please try again.{str(e)}"
     
 def create_presigned_url(object_key: str, expiration: int = 3600) -> str:
     """
@@ -293,49 +163,137 @@ def create_presigned_url(object_key: str, expiration: int = 3600) -> str:
         print(f"❌ An unexpected error occurred generating pre-signed URL: {e}")
         return None
     
+# --- NEW: Dedicated LLM Client Setup ---
+# Initialize a separate session for the LLM using the new specific keys
+azure_client = AzureOpenAI(
+    azure_endpoint=os.getenv("AZURE_OPENAI_END_POINT"), 
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
+    api_version="2024-12-01-preview" # Use the latest stable version available in your portal
+)
+
+# CRITICAL: This must match the name you typed when you deployed the model in Azure Portal
+# e.g., "gpt-5-deployment" or "my-gpt-model"
+DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5") 
+
+def call_llm(context_text: str, user_query: str) -> str:
+    # 1. TIME INJECTION
+    current_date = datetime.now().strftime("%A, %B %d, %Y")
+    
+    """
+    Calls Azure OpenAI (GPT Chat Model)
+    """
+    
+    # 2. System Prompt (Cleaned up for Chat API)
+    # We don't need the <|begin_of_text|> tags anymore; the Chat API handles roles natively.
+    system_instruction = f"""
+    You are an expert AI analyst. 
+    Current Date: {current_date}
+    
+    INSTRUCTIONS:
+    1. PRIMARY GOAL: Answer the user's question accurately based on the provided context.
+    
+    2. HANDLING GREETINGS vs UNKNOWN INFO:
+       - If user greets ("Hi", "Hello"):
+         HEADER: ### SOURCE: General Analysis
+         REASON: [[REASON: Greeting]]
+         ANSWER: Hello! I am ready to analyze your documents.
+         
+       - If question is NOT in context:
+         HEADER: ### SOURCE: General Analysis
+         REASON: [[REASON: Outside of knowledge base]]
+         ANSWER: I apologize, but I cannot find information regarding that topic in your uploaded documents.
+
+    3. DOCUMENT ANSWERS (Strict Format):
+       ### SOURCE: [Insert Exact Filename from tag]
+       [[REASON: one sentence reasoning...]]
+       [Answer derived from this document]
+
+    CRITICAL: 
+    - If a document is irrelevant, DO NOT LIST IT.
+    - If no info is found:
+      ### SOURCE: General Analysis
+      [[REASON: Context missing]]
+      I apologize, but I couldn't find specific information regarding that in the uploaded documents.
+    """
+
+    # 3. Message Construction
+    messages = [
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {user_query}"}
+    ]
+
+    try:
+        response = azure_client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=2048,
+            top_p=0.9
+        )
+        
+        answer = response.choices[0].message.content.strip()
+
+        # --- FALLBACK RETRY LOGIC (Same as before but adapted) ---
+        # If response is empty, retry with half context
+        if not answer:
+            print("⚠️ Empty response from Azure. Retrying with shorter context...")
+            half_context = context_text[:len(context_text)//2]
+            
+            messages[1]['content'] = f"Context:\n{half_context}\n\nQuestion: {user_query}"
+            
+            response = azure_client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=2048
+            )
+            answer = response.choices[0].message.content.strip()
+            
+            if not answer:
+                return "Error: The query and documents are too large for the model to process at once. Please ask a more specific question."
+
+        return answer
+
+    except Exception as e:
+        print(f"CRITICAL ERROR in call_llm (Azure): {str(e)}")
+        return f"Error calling AI: System is currently overloaded. {str(e)}"
+
+
 def determine_search_depth(user_query: str) -> int:
     """
-    Uses LLM to dynamically decide how many chunks to retrieve.
-    Returns an integer (e.g., 5, 20, 50).
+    Uses Azure OpenAI to dynamically decide retrieval depth.
     """
-    prompt = f"""
-    <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    system_instruction = """
     You are a Search Optimization Engine. Analyze the user's query and output ONLY a single integer representing the optimal number of document chunks ('top_k') to retrieve.
 
     RULES:
     - If the query seeks a specific fact (e.g., "What is the date?", "Who is..."), output 10.
     - If the query asks for a comparison (e.g., "Compare X and Y"), output 25.
-    - If the query is broad, exhaustive, or asks for lists/summaries across many files (e.g., "List all...", "Find every...", "Summary of agreements"), output 60.
+    - If the query is broad, exhaustive, or asks for lists (e.g., "List all...", "Summary of..."), output 60.
     
     Output ONLY the integer. No text.
-    <|eot_id|><|start_header_id|>user<|end_header_id|>
-    {user_query}
-    <|eot_id|><|start_header_id|>assistant<|end_header_id|>
     """
 
-    body = {
-        "prompt": prompt,
-        "max_gen_len": 10, # We only need a number
-        "temperature": 0.0 # Deterministic
-    }
-
     try:
-        response = bedrock_client.invoke_model(
-            modelId="meta.llama3-70b-instruct-v1:0",
-            body=json.dumps(body)
+        response = azure_client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_query}
+            ],
+            temperature=0.0, # Deterministic
+            max_tokens=10
         )
-        response_body = json.loads(response['body'].read())
-        answer = response_body.get('generation', '').strip()
+        
+        answer = response.choices[0].message.content.strip()
         
         # Extract number safely
-        import re
         match = re.search(r'\d+', answer)
         if match:
             k = int(match.group())
-            # Safety bounds
             return max(5, min(k, 100))
-        return 20 # Default fallback
+        return 20 
         
     except Exception as e:
-        print(f"⚠️ Intent Error: {e}")
-        return 20 # Safe fallback    
+        print(f"⚠️ Intent Error (Azure): {e}")
+        return 20
