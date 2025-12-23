@@ -205,7 +205,7 @@ def call_llm(context_text: str, user_query: str) -> str:
 
     3. DOCUMENT ANSWERS (Strict Format):
        ### SOURCE: [Insert Exact Filename from tag]
-       [[REASON: one sentence reasoning...]]
+       [[REASON: two apt reasoning for the user query...]]
        [Answer derived from this document]
 
     CRITICAL: 
