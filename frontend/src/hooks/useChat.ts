@@ -1,36 +1,43 @@
+// src/hooks/useChat.ts
 import { useState } from 'react';
 import { sendMessage } from '../api/client';
-import type{ Message } from '../api/types';
+import type { Message } from '../api/types';
 
 export const useChat = () => {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: '1',
       role: 'assistant',
-      content: 'Hello! I am ConTrackt AI. I can analyze your documents instantly. Upload a file to get started!',
+      content: 'Hello! I am ConTrackt AI. I am ready to analyze your documents.',
       timestamp: new Date()
     }
   ]);
   const [loading, setLoading] = useState(false);
 
-  const handleSend = async (text: string) => {
+  // Use a prefix key that ChatBubble looks for
+  const addSystemMessage = (text: string) => {
+    setMessages(prev => [...prev, {
+      id: Date.now().toString(),
+      role: 'assistant',
+      content: `SYSTEM_UPDATE: ${text}`, // <--- Key for styling
+      timestamp: new Date()
+    }]);
+  };
+
+  const resetChat = () => {
+  setMessages((prev) => [prev[0]]); // keep system intro message
+};
+
+
+  const handleSend = async (text: string, category?: string, docIds?: number[]) => {
     if (!text.trim()) return;
 
-    // 1. Add User Message
-    const userMsg: Message = { 
-      id: Date.now().toString(), 
-      role: 'user', 
-      content: text, 
-      timestamp: new Date() 
-    };
+    const userMsg: Message = { id: Date.now().toString(), role: 'user', content: text, timestamp: new Date() };
     setMessages(prev => [...prev, userMsg]);
     setLoading(true);
 
     try {
-      // 2. API Call
-      const data = await sendMessage(text);
-      
-      // 3. Add AI Response
+      const data = await sendMessage(text, category, docIds);
       const aiMsg: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
@@ -51,5 +58,5 @@ export const useChat = () => {
     }
   };
 
-  return { messages, loading, handleSend };
+  return { messages, loading, handleSend, addSystemMessage, resetChat };
 };

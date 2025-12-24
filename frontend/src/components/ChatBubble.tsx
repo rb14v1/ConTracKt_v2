@@ -1,6 +1,6 @@
 // src/components/ChatBubble.tsx
 import React, { useState } from 'react';
-import { Bot, User, FileText, ExternalLink, Quote, ChevronDown, ChevronUp, Sparkles, Activity } from 'lucide-react';
+import { Bot, User, FileText, ExternalLink, Quote, ChevronDown, ChevronUp, Sparkles, Activity, Info } from 'lucide-react';
 import type { Message, Source } from '../api/types';
 import { clsx } from 'clsx';
 
@@ -121,59 +121,68 @@ interface Props {
 
 export const ChatBubble: React.FC<Props> = ({ message }) => {
   const isUser = message.role === 'user';
+  const isSystem = message.content.startsWith('SYSTEM_UPDATE:');
 
+  // --- SPECIAL RENDERER: System Updates (The "Pill") ---
+  if (isSystem) {
+    // Strip the prefix and any leftover markdown stars
+    const cleanText = message.content.replace('SYSTEM_UPDATE:', '').replace(/\*\*/g, '').trim();
+    
+    return (
+      <div className="flex justify-center my-4 w-full animate-in fade-in zoom-in-95 duration-300">
+        <div className="flex items-center gap-2 px-4 py-1.5 bg-gray-50 border border-gray-200 rounded-full shadow-sm">
+            <Info className="w-3.5 h-3.5 text-teal-500" />
+            <span className="text-[11px] font-medium text-gray-500 tracking-wide uppercase">
+                {cleanText}
+            </span>
+        </div>
+      </div>
+    );
+  }
+
+  // --- STANDARD RENDERER: Chat Bubbles ---
   const findSource = (title: string, sources?: Source[]): Source | undefined => {
     if (!sources) return undefined;
-
-    return sources.find(s =>
-      s.title.trim().toLowerCase() === title.trim().toLowerCase() ||
-      s.title.includes(title) ||
-      title.includes(s.title)
-    );
+    return sources.find(s => s.title.includes(title) || title.includes(s.title));
   };
-
 
   const renderContent = (text: string, sources?: Source[]) => {
     if (!text.includes('### SOURCE:')) {
-      return <p className="whitespace-pre-wrap">{text}</p>;
+      return <p className="whitespace-pre-wrap leading-relaxed">{text}</p>;
     }
+    
     const parts = text.split('### SOURCE:').filter(part => part.trim());
 
     return (
-      <div className="space-y-6">
+      <div className="space-y-4">
         {parts.map((part, idx) => {
           const [titleLine, ...contentLines] = part.split('\n');
           const cleanTitle = titleLine.trim().replace(/[\[\]]/g, '');
           const content = contentLines.join('\n').trim();
           const source = findSource(cleanTitle, sources);
-
-          return (
-            <SourceBlock
-              key={idx}
-              title={cleanTitle}
-              content={content}
-              source={source}
-            />
-          );
+          return <SourceBlock key={idx} title={cleanTitle} content={content} source={source} />;
         })}
       </div>
     );
   };
 
   return (
-    <div className={clsx("flex gap-4 mb-8", isUser ? "flex-row-reverse" : "flex-row")}>
+    <div className={clsx("flex gap-3 mb-6", isUser ? "flex-row-reverse" : "flex-row")}>
+      
+      {/* Icon Avatar */}
       <div className={clsx(
-        "w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 shadow-sm border",
-        isUser ? "bg-teal-700 border-teal-800" : "bg-white border-gray-200"
+        "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 shadow-sm border transition-all",
+        isUser ? "bg-teal-600 border-teal-700" : "bg-white border-gray-100"
       )}>
-        {isUser ? <User className="text-white w-5 h-5" /> : <Bot className="text-teal-600 w-5 h-5" />}
+        {isUser ? <User className="text-white w-4 h-4" /> : <Bot className="text-teal-500 w-5 h-5" />}
       </div>
 
+      {/* Bubble Body */}
       <div className={clsx(
-        "max-w-[95%] md:max-w-[85%] rounded-xl p-5 text-sm leading-relaxed shadow-sm",
+        "max-w-[85%] lg:max-w-[75%] rounded-2xl px-4 py-3 text-sm shadow-sm transition-all",
         isUser
-          ? "bg-teal-700 text-white"
-          : "bg-white text-gray-800 border border-gray-200"
+          ? "bg-teal-600 text-white rounded-tr-none" // Darker teal, white text, sharp corner
+          : "bg-white text-gray-700 border border-gray-100 rounded-tl-none" // White, grey text
       )}>
         {renderContent(message.content, message.sources)}
       </div>

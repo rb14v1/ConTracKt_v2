@@ -68,34 +68,55 @@ def get_embedding(text: str) -> list:
     body = json.loads(response['body'].read())
     return body['embedding']
 
-def search_vector_db(query_text: str, top_k: int = 5):
+def search_vector_db(query_text: str, top_k: int = 5, category_filter: str = None, doc_ids: list[int] = None):
     """
-    Semantically searches the Postgres DB using pgvector
+    Search Logic Hierarchy:
+    1. doc_ids (Strict)
+    2. category (Scoped)
+    3. All (Global)
     """
     query_vec = get_embedding(query_text)
     
-    # FIX IS HERE: .select_related('document')
-    # This fetches the Document title immediately, preventing the async error later.
-    results = DocumentChunk.objects.select_related('document').annotate(
+    qs = DocumentChunk.objects.select_related('document')
+    
+    # 🔥 RULE 1 & 2: If doc_ids exist, search ONLY these. Ignore Category.
+    if doc_ids and len(doc_ids) > 0:
+        qs = qs.filter(document_id__in=doc_ids)
+        
+    # 🔥 RULE 3: No doc_ids, but Category exists -> Search Category.
+    elif category_filter and category_filter != 'all':
+        qs = qs.filter(document__category=category_filter)
+        
+    # 🔥 RULE 4: Neither exists -> Search All (No filter applied)
+
+    results = qs.annotate(
         distance=CosineDistance('embedding', query_vec)
     ).order_by('distance')[:top_k]
     
     return results
 
 
-def search_hybrid(query_text: str, top_k: int = 15):
+def search_hybrid(query_text: str, top_k: int = 15, category_filter: str = None, doc_ids: list[int] = None):
     """
-    Performs Hybrid Search with RRF Fusion
+    Hybrid Search honoring the same hierarchy
     """
-    # 1. Run Vector Search
-    vector_results = search_vector_db(query_text, top_k=20)
+    # 1. Run Vector Search (Passes strict logic down)
+    vector_results = search_vector_db(query_text, top_k=20, category_filter=category_filter, doc_ids=doc_ids)
     
-    # 2. Run Keyword Search
-    keyword_results = DocumentChunk.objects.annotate(
+    # 2. Run Keyword Search (Apply SAME strict logic)
+    keyword_qs = DocumentChunk.objects.select_related('document').annotate(
         rank=SearchRank(F('search_vector'), SearchQuery(query_text))
-    ).filter(rank__gt=0).order_by('-rank')[:20]
+    )
+    
+    # Apply exactly the same filters to keywords
+    if doc_ids and len(doc_ids) > 0:
+        keyword_qs = keyword_qs.filter(document_id__in=doc_ids)
+    elif category_filter and category_filter != 'all':
+        keyword_qs = keyword_qs.filter(document__category=category_filter)
+        
+    keyword_results = keyword_qs.filter(rank__gt=0).order_by('-rank')[:20]
 
-    # 3. Apply Reciprocal Rank Fusion (RRF)
+    # ... (RRF Logic below remains exactly the same) ...
     k_constant = 60
     rrf_scores = {}
 
@@ -107,10 +128,8 @@ def search_hybrid(query_text: str, top_k: int = 15):
         if item.id not in rrf_scores: rrf_scores[item.id] = 0
         rrf_scores[item.id] += 1 / (k_constant + rank + 1)
 
-    # 4. Sort IDs by Score
     sorted_ids = sorted(rrf_scores, key=rrf_scores.get, reverse=True)[:top_k]
 
-    # 5. Fetch Objects & ATTACH SCORES (The Fix)
     candidates = DocumentChunk.objects.filter(id__in=sorted_ids).select_related('document')
     candidate_map = {c.id: c for c in candidates}
     
@@ -118,14 +137,10 @@ def search_hybrid(query_text: str, top_k: int = 15):
     for _id in sorted_ids:
         if _id in candidate_map:
             chunk = candidate_map[_id]
-            # --- CRITICAL FIX: Attach the score dynamically ---
             chunk.score = rrf_scores[_id] 
             final_results.append(chunk)
 
     return final_results
-
-# api/services.py (Update this function)
-
     
 def create_presigned_url(object_key: str, expiration: int = 3600) -> str:
     """
@@ -297,3 +312,44 @@ def determine_search_depth(user_query: str) -> int:
     except Exception as e:
         print(f"⚠️ Intent Error (Azure): {e}")
         return 20
+
+
+def extract_dates_from_text(text_sample: str) -> dict:
+    """
+    Asks LLM to find effective and expiry dates in the text.
+    Returns JSON: {"effective_date": "YYYY-MM-DD", "expiry_date": "YYYY-MM-DD"}
+    """
+    system_instruction = """
+    You are a Data Extraction Bot. Analyze the contract text and extract:
+    1. Effective Date (Start Date)
+    2. Expiration Date (End Date / Due Date)
+
+    Output STRICT JSON only:
+    {
+      "effective_date": "YYYY-MM-DD" or null,
+      "expiry_date": "YYYY-MM-DD" or null
+    }
+    
+    RULES:
+    - If the contract says "1 year from effective date", calculate it if possible, otherwise null.
+    - If date is ambiguous, return null.
+    - Do NOT output markdown or explanations. Just the JSON object.
+    """
+
+    try:
+        response = azure_client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": f"Extract dates from this contract snippet:\n\n{text_sample}"}
+            ],
+            temperature=0.0, # Strict deterministic output
+            max_tokens=100,
+            response_format={ "type": "json_object" } # Force JSON mode (avail in newer Azure models)
+        )
+        
+        data = json.loads(response.choices[0].message.content)
+        return data
+    except Exception as e:
+        print(f"⚠️ Date Extraction Failed: {e}")
+        return {"effective_date": None, "expiry_date": None}    
