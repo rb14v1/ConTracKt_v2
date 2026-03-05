@@ -45,7 +45,7 @@ export const Welcome = () => {
       <div className="flex-1 flex flex-col items-center justify-center text-center -mt-10 h-full animate-in fade-in duration-500 font-sans">
 
         <h1 className="text-5xl font-bold text-[#21b0be] mb-6 drop-shadow-sm select-none">
-          Welcomes
+          Welcome
         </h1>
 
         <div className="text-xl text-[#757575] font-mono mb-12 min-h-[32px] border-r-4 border-[#7E57C2] pr-2 animate-pulse select-none">
